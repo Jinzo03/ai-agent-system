@@ -1,12 +1,13 @@
 import os
 import sys
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 # ==========================================
-# STABILITY & COMPATIBILITY LAYER (Codex Patches)
+# STABILITY & COMPATIBILITY LAYER
 # ==========================================
 CREWAI_STORAGE_DIR = Path(__file__).parent / ".crewai_storage"
 os.environ["CREWAI_DISABLE_TELEMETRY"] = "true"
@@ -30,151 +31,133 @@ _kickoff_storage.db_storage_path = local_crewai_storage_path
 
 load_dotenv()
 
-# Set up the active Groq model
 groq_llm = LLM(
     model="groq/llama-3.3-70b-versatile",
     api_key=os.environ.get("GROQ_API_KEY")
 )
 
 # ==========================================
-# STEP 1: INITIALIZE FASTAPI APP
+# STEP 1: INITIALIZE FASTAPI & IN-MEMORY CACHE
 # ==========================================
-app = FastAPI(
-    title="Autonomous Industrial Incident API",
-    description="Microservice to trigger Multi-Agent CrewAI inspections for 12V DC Motors.",
-    version="1.0.0"
-)
+app = FastAPI(title="Async Industrial Incident API")
 
-# Define the structured request body requirements
+# Simple dictionary acting as an in-memory database to store crew reports
+jobs_db = {}
+
 class IncidentRequest(BaseModel):
     motor_id: str
 
 # ==========================================
-# STEP 2: DEFINE CUSTOM TOOLS
+# STEP 2: TOOLS (Unchanged, Fast, Local)
 # ==========================================
-
 @tool("Fetch Motor Telemetry Data")
 def fetch_motor_telemetry(motor_id: str) -> str:
-    """
-    Queries live telemetry logs for an active factory motor.
-    Returns sensor values tracking Voltage (V), Current (A), and Speed (RPM).
-    """
+    """Queries live telemetry logs for an active factory motor."""
     motor_database = {
         "M-404": "TIMESTAMP: 16:12:05 | CURRENT: 18.5 A | VOLTAGE: 10.2 V | SPEED: 450 RPM",
         "M-200": "TIMESTAMP: 16:12:05 | CURRENT: 2.3 A | VOLTAGE: 12.0 V | SPEED: 1150 RPM"
     }
-    
     normalized_id = motor_id.strip().upper()
-    if normalized_id in motor_database:
-        return f"Telemetry snapshot for {normalized_id}: {motor_database[normalized_id]}"
-    else:
-        return f"Warning: Motor ID '{motor_id}' not found in active telemetry register."
-
+    return f"Telemetry snapshot for {normalized_id}: {motor_database.get(normalized_id, 'Not Found')}"
 
 @tool("Search Technical Manual")
 def search_technical_manual(query: str) -> str:
-    """
-    Searches the company's technical manual (rapport_technique_dataset_reel.pdf) 
-    for specific terms ('Surcharge', 'Courant') and extracts the page text context.
-    """
+    """Searches the technical manual PDF for context pages."""
     from pypdf import PdfReader
-    
     pdf_path = "rapport_technique_dataset_reel.pdf"
-    if not os.path.exists(pdf_path):
-        return f"Error: Technical manual file '{pdf_path}' not found."
-    
+    if not os.path.exists(pdf_path): return "Error: Manual missing."
     try:
         reader = PdfReader(pdf_path)
-        matched_pages = []
-        keywords = [k.lower().strip() for k in query.split() if len(k.strip()) > 2]
-        if not keywords:
-            keywords = [query.lower().strip()]
-            
+        matched = []
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
-            if text and any(kw in text.lower() for kw in keywords):
-                matched_pages.append(f"--- PAGE {i+1} ---\n{text.strip()}")
-                
-        if matched_pages:
-            return "\n\n".join(matched_pages[:3])
-        return f"No context found matching '{query}' inside manual."
-    except Exception as e:
-        return f"Error reading manual: {str(e)}"
+            if text and any(k in text.lower() for k in query.lower().split()):
+                matched.append(f"--- PAGE {i+1} ---\n{text.strip()}")
+        return "\n\n".join(matched[:2]) if matched else "No context found."
+    except Exception as e: return str(e)
 
 
 # ==========================================
-# STEP 3: API ENDPOINT (The Operational Core)
+# STEP 3: BACKGROUND WORKER FUNCTION
 # ==========================================
-
-@app.post("/api/v1/analyze")
-def trigger_incident_analysis(request: IncidentRequest):
-    print(f"Received analysis request for target: {request.motor_id}")
-    
-    # 1. Re-initialize Agents cleanly per API call
-    data_engineer = Agent(
-        role='Senior Industrial Data Engineer',
-        goal='Query raw motor telemetry via tools and identify statistical anomalies.',
-        backstory='Expert in ESP32 sensor parsing for 12V DC motors. Knows healthy bounds (< 5 Amps).',
-        verbose=False,
-        allow_delegation=False,
-        llm=groq_llm,
-        tools=[fetch_motor_telemetry]
-    )
-
-    diagnostic_analyst = Agent(
-        role='Mechanical Diagnostic Analyst',
-        goal='Determine the physical root cause of a motor fault strictly based on the company technical manual.',
-        backstory='Electromechanical systems expert who cross-references telemetry issues directly with documentation.',
-        verbose=False,
-        allow_delegation=False,
-        llm=groq_llm,
-        tools=[search_technical_manual]
-    )
-
-    operations_manager = Agent(
-        role='Factory Operations Manager',
-        goal='Draft a concise, actionable incident report for the maintenance team.',
-        backstory='Floor supervisor who demands clean, technical-jargon-free Markdown lists outlining updates.',
-        verbose=False,
-        allow_delegation=False,
-        llm=groq_llm
-    )
-
-    # 2. Dynamically pass the API payload (motor_id) straight into the task description
-    task_analyze_data = Task(
-        description=f'Use your tools to query the active telemetry database for motor {request.motor_id}. Review the returned readings and assess if they indicate normal operations or an anomaly.',
-        expected_output='A short summary analyzing the fetched telemetry profile.',
-        agent=data_engineer
-    )
-
-    task_diagnose_fault = Task(
-        description='Take the data engineer\'s analysis. Use the search_technical_manual tool to check the manual for "Surcharge" or "Courant" to determine what physical phenomenon matches these specific numbers.',
-        expected_output='A 2-sentence diagnosis citing the technical manual findings.',
-        agent=diagnostic_analyst
-    )
-
-    task_write_report = Task(
-        description='Compile findings into a clean Markdown incident report detailing data fetched, physical fault diagnosed, and mitigation actions.',
-        expected_output='A professional, clean Markdown formatted incident report.',
-        agent=operations_manager
-    )
-
-    # 3. Assemble and execute
+def run_crew_worker(job_id: str, motor_id: str):
+    """This function runs inside an isolated background thread."""
     try:
-        incident_crew = Crew(
+        data_engineer = Agent(
+            role='Senior Industrial Data Engineer',
+            goal='Query raw motor telemetry via tools and identify statistical anomalies.',
+            backstory='Expert in ESP32 sensor parsing for 12V DC motors.',
+            llm=groq_llm, tools=[fetch_motor_telemetry]
+        )
+        diagnostic_analyst = Agent(
+            role='Mechanical Diagnostic Analyst',
+            goal='Determine physical root causes strictly based on technical manuals.',
+            backstory='Electromechanical systems expert.',
+            llm=groq_llm, tools=[search_technical_manual]
+        )
+        operations_manager = Agent(
+            role='Factory Operations Manager',
+            goal='Draft a concise, actionable incident report for the maintenance team.',
+            backstory='Floor supervisor requiring Markdown outputs.',
+            llm=groq_llm
+        )
+
+        task_analyze_data = Task(
+            description=f'Query active telemetry database for motor {motor_id} and assess operations.',
+            expected_output='A summary analyzing metrics.', agent=data_engineer
+        )
+        task_diagnose_fault = Task(
+            description='Analyze data. Search manual for "Surcharge" or "Courant" to diagnose.',
+            expected_output='A 2-sentence diagnosis citing the manual.', agent=diagnostic_analyst
+        )
+        task_write_report = Task(
+            description='Compile findings into a clean Markdown incident report.',
+            expected_output='A professional clean Markdown formatted incident report.', agent=operations_manager
+        )
+
+        crew = Crew(
             agents=[data_engineer, diagnostic_analyst, operations_manager],
             tasks=[task_analyze_data, task_diagnose_fault, task_write_report],
             process=Process.sequential
         )
         
-        # Kickoff returns a CrewOutput object; convert it to string
-        final_markdown_report = str(incident_crew.kickoff())
-        
-        return {
-            "status": "success",
-            "target_motor": request.motor_id,
-            "report": final_markdown_report
+        # Execute the crew and save output to our database
+        output = crew.kickoff()
+        jobs_db[job_id] = {
+            "status": "completed",
+            "target_motor": motor_id,
+            "report": str(output)
         }
-        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent Execution Failure: {str(e)}")
+        jobs_db[job_id] = {
+            "status": "failed",
+            "error": str(e)
+        }
+
+# ==========================================
+# STEP 4: ASYNC API ENDPOINTS
+# ==========================================
+
+@app.post("/api/v1/analyze")
+def trigger_analysis(request: IncidentRequest, background_tasks: BackgroundTasks):
+    # Generate a unique tracking token for this operation
+    job_id = str(uuid.uuid4())
+    
+    # Register job state as working
+    jobs_db[job_id] = {"status": "processing", "target_motor": request.motor_id}
+    
+    # Hand the job off to the FastAPI background worker thread instantly
+    background_tasks.add_task(run_crew_worker, job_id, request.motor_id)
+    
+    # Return immediately to the client
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "check_status_url": f"/api/v1/status/{job_id}"
+    }
+
+@app.get("/api/v1/status/{job_id}")
+def get_job_status(job_id: str):
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Job execution ID not found.")
+    return jobs_db[job_id]
