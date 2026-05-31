@@ -1,8 +1,12 @@
+from crewai_tools import PDFSearchTool
 import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+# ==========================================
+# STABILITY & COMPATIBILITY LAYER (Codex Patches)
+# ==========================================
 CREWAI_STORAGE_DIR = Path(__file__).parent / ".crewai_storage"
 os.environ["CREWAI_DISABLE_TELEMETRY"] = "true"
 os.environ["LITELLM_LOG"] = "ERROR"
@@ -10,51 +14,80 @@ os.environ["LITELLM_LOG"] = "ERROR"
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-
 def local_crewai_storage_path() -> str:
     CREWAI_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     return str(CREWAI_STORAGE_DIR)
 
-# This prevents crewAI from embedding 'cache_breakpoint' inside messages sent to Groq.
+# Fixes the 'cache_breakpoint' injection crash on Groq's API
 import crewai.llms.cache as _crewai_cache
 _crewai_cache.mark_cache_breakpoint = lambda msg: msg
 
 from crewai import Agent, Task, Crew, Process, LLM
+from crewai.tools import tool  # 🔧 Import the tool decorator
 import crewai.memory.storage.kickoff_task_outputs_storage as _kickoff_storage
 
 _kickoff_storage.db_storage_path = local_crewai_storage_path
 
-# 1. Load the API key from the .env file
+# Load the API key
 load_dotenv()
 
-print("Booting up the Autonomous Industrial Incident Team...")
+print("Booting up the Autonomous Industrial Incident Team with Function Calling...")
 
-# 2. Explicitly define the Groq LLM
+# Set up the active Groq model
 groq_llm = LLM(
     model="groq/llama-3.3-70b-versatile",
     api_key=os.environ.get("GROQ_API_KEY")
 )
 
+# Create the RAG tool pointing to your exact technical report
+technical_manual_tool = PDFSearchTool(pdf='rapport_technique_dataset_reel.pdf')
+
 # ==========================================
-# STEP 1: DEFINE THE AGENTS
+# STEP 1: DEFINE CUSTOM TOOLS
+# ==========================================
+
+@tool("Fetch Motor Telemetry Data")
+def fetch_motor_telemetry(motor_id: str) -> str:
+    """
+    Queries live telemetry logs for an active factory motor.
+    Returns sensor values tracking Voltage (V), Current (A), and Speed (RPM) 
+    matching the ESP32 physical configuration layout.
+    """
+    # Simulated data endpoints modeled directly after the project telemetry profiles
+    motor_database = {
+        "M-404": "TIMESTAMP: 16:12:05 | CURRENT: 18.5 A | VOLTAGE: 10.2 V | SPEED: 450 RPM",
+        "M-200": "TIMESTAMP: 16:12:05 | CURRENT: 2.3 A | VOLTAGE: 12.0 V | SPEED: 1150 RPM"
+    }
+    
+    normalized_id = motor_id.strip().upper()
+    if normalized_id in motor_database:
+        return f"Telemetry snapshot for {normalized_id}: {motor_database[normalized_id]}"
+    else:
+        return f"Warning: Motor ID '{motor_id}' not found in active telemetry register."
+
+
+# ==========================================
+# STEP 2: DEFINE THE AGENTS (With Tools)
 # ==========================================
 
 data_engineer = Agent(
     role='Senior Industrial Data Engineer',
-    goal='Analyze raw motor telemetry and identify statistical anomalies.',
+    goal='Query raw motor telemetry via tools and identify statistical anomalies.',
     backstory='You have 10 years of experience reading ESP32 sensor data for 12V DC motors. You know that a healthy motor runs under 5 Amps, and any sudden spike indicates a severe issue.',
     verbose=False,
     allow_delegation=False,
-    llm=groq_llm
+    llm=groq_llm,
+    tools=[fetch_motor_telemetry]  # 🔧 Giving the tool exclusively to the engineer
 )
 
 diagnostic_analyst = Agent(
     role='Mechanical Diagnostic Analyst',
-    goal='Determine the physical root cause of a motor fault based on data anomalies.',
-    backstory='You are an expert in electromechanical systems. You translate raw numbers (like voltage drops or current spikes) into physical realities (like mechanical jams or short circuits).',
+    goal='Determine the physical root cause of a motor fault strictly based on the company technical manual.',
+    backstory='You are an expert in electromechanical systems. You do not guess. You always search the technical documentation to map data anomalies (like high current) to their official physical causes.',
     verbose=False,
     allow_delegation=False,
-    llm=groq_llm
+    llm=groq_llm,
+    tools=[technical_manual_tool]  #The RAG Tool is equipped!
 )
 
 operations_manager = Agent(
@@ -67,31 +100,29 @@ operations_manager = Agent(
 )
 
 # ==========================================
-# STEP 2: DEFINE THE TASKS
+# STEP 3: DEFINE THE TASKS (Dynamic Execution)
 # ==========================================
 
-simulated_telemetry = "TIMESTAMP: 14:02:11 | CURRENT: 18.5 A | VOLTAGE: 10.2 V | SPEED: 450 RPM"
-
 task_analyze_data = Task(
-    description=f'Review the following live telemetry from motor #M-404: {simulated_telemetry}. Identify if this represents a normal state or a fault.',
-    expected_output='A short summary of the data highlighting any abnormal metrics.',
+    description='Use your tools to query the active telemetry database for motor M-404. Review the returned readings and assess if they indicate normal operations or an electrical/mechanical anomaly.',
+    expected_output='A short summary analyzing the fetched telemetry profile and highlighting any out-of-bounds metrics.',
     agent=data_engineer
 )
 
 task_diagnose_fault = Task(
-    description='Take the data engineer\'s analysis. Determine the most likely physical cause of this state (e.g., is the motor jammed? is there a short circuit?).',
-    expected_output='A 2-sentence diagnosis of the root physical cause.',
+    description='Take the data engineer\'s analysis. Use the PDFSearchTool to search the technical manual for "Surcharge" or "Courant" to determine what physical phenomenon causes these specific data spikes.',
+    expected_output='A 2-sentence diagnosis citing the technical manual.',
     agent=diagnostic_analyst
 )
 
 task_write_report = Task(
-    description='Take the diagnosis and write a final Incident Report. Include the raw data, the diagnosis, and recommended next steps for the maintenance team. Output strictly in Markdown format.',
-    expected_output='A professional Markdown formatted incident report.',
+    description='Compile the technical findings into a clean Markdown incident report. Outline what data was fetched by the tools, what physical fault was diagnosed, and list actionable mitigation steps for the repair crews.',
+    expected_output='A professional, clean Markdown formatted incident report.',
     agent=operations_manager
 )
 
 # ==========================================
-# STEP 3: ASSEMBLE THE CREW
+# STEP 4: RUN THE AUTOMATED SYSTEM
 # ==========================================
 
 incident_crew = Crew(
@@ -100,10 +131,9 @@ incident_crew = Crew(
     process=Process.sequential
 )
 
-# Start the execution!
 result = incident_crew.kickoff()
 
 print("\n\n================================================")
-print("FINAL OUTPUT GENERATED BY THE SYSTEM:")
+print("FINAL OUTPUT GENERATED BY THE SYSTEM (DYNAMIC TOOL EXECUTION):")
 print("================================================\n")
 print(result)
