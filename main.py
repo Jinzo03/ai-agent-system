@@ -1,4 +1,3 @@
-from crewai_tools import PDFSearchTool
 import os
 import sys
 from pathlib import Path
@@ -39,9 +38,6 @@ groq_llm = LLM(
     api_key=os.environ.get("GROQ_API_KEY")
 )
 
-# Create the RAG tool pointing to your exact technical report
-technical_manual_tool = PDFSearchTool(pdf='rapport_technique_dataset_reel.pdf')
-
 # ==========================================
 # STEP 1: DEFINE CUSTOM TOOLS
 # ==========================================
@@ -53,7 +49,6 @@ def fetch_motor_telemetry(motor_id: str) -> str:
     Returns sensor values tracking Voltage (V), Current (A), and Speed (RPM) 
     matching the ESP32 physical configuration layout.
     """
-    # Simulated data endpoints modeled directly after the project telemetry profiles
     motor_database = {
         "M-404": "TIMESTAMP: 16:12:05 | CURRENT: 18.5 A | VOLTAGE: 10.2 V | SPEED: 450 RPM",
         "M-200": "TIMESTAMP: 16:12:05 | CURRENT: 2.3 A | VOLTAGE: 12.0 V | SPEED: 1150 RPM"
@@ -64,6 +59,46 @@ def fetch_motor_telemetry(motor_id: str) -> str:
         return f"Telemetry snapshot for {normalized_id}: {motor_database[normalized_id]}"
     else:
         return f"Warning: Motor ID '{motor_id}' not found in active telemetry register."
+
+
+@tool("Search Technical Manual")
+def search_technical_manual(query: str) -> str:
+    """
+    Searches the company's technical manual (rapport_technique_dataset_reel.pdf) 
+    for specific technical terms (such as 'Surcharge' or 'Courant') and extracts the text context.
+    """
+    from pypdf import PdfReader
+    
+    pdf_path = "rapport_technique_dataset_reel.pdf"
+    if not os.path.exists(pdf_path):
+        return f"Error: Technical manual file '{pdf_path}' not found in the current directory."
+    
+    try:
+        reader = PdfReader(pdf_path)
+        matched_pages = []
+        
+        # Breakdown query into independent search keywords
+        keywords = [k.lower().strip() for k in query.split() if len(k.strip()) > 2]
+        if not keywords:
+            keywords = [query.lower().strip()]
+            
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+            
+            # Match keywords case-insensitively
+            if any(kw in text.lower() for kw in keywords):
+                matched_pages.append(f"--- PAGE {i+1} ---\n{text.strip()}")
+                
+        if matched_pages:
+            # Return up to the first 3 relevant pages to stay within safe model context bounds
+            return "\n\n".join(matched_pages[:3])
+        else:
+            return f"No direct text matched '{query}' in the manual. Try searching with individual terms like 'Surcharge' or 'Courant'."
+            
+    except Exception as e:
+        return f"Error reading technical manual: {str(e)}"
 
 
 # ==========================================
@@ -77,7 +112,7 @@ data_engineer = Agent(
     verbose=False,
     allow_delegation=False,
     llm=groq_llm,
-    tools=[fetch_motor_telemetry]  # 🔧 Giving the tool exclusively to the engineer
+    tools=[fetch_motor_telemetry]
 )
 
 diagnostic_analyst = Agent(
@@ -87,7 +122,7 @@ diagnostic_analyst = Agent(
     verbose=False,
     allow_delegation=False,
     llm=groq_llm,
-    tools=[technical_manual_tool]  #The RAG Tool is equipped!
+    tools=[search_technical_manual]  # 🔧 Swapped to our secure local manual tool
 )
 
 operations_manager = Agent(
@@ -110,7 +145,7 @@ task_analyze_data = Task(
 )
 
 task_diagnose_fault = Task(
-    description='Take the data engineer\'s analysis. Use the PDFSearchTool to search the technical manual for "Surcharge" or "Courant" to determine what physical phenomenon causes these specific data spikes.',
+    description='Take the data engineer\'s analysis. Use the search_technical_manual tool to search the technical manual for "Surcharge" or "Courant" to determine what physical phenomenon causes these specific data spikes.',
     expected_output='A 2-sentence diagnosis citing the technical manual.',
     agent=diagnostic_analyst
 )
