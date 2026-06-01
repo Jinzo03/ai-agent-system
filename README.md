@@ -44,7 +44,7 @@ Both services are containerized and orchestrated via Docker Compose. The backend
 
 ---
 
-## 🤖 The AI Crew — Agent Breakdown
+##  The AI Crew — Agent Breakdown
 
 ### Agent 1 — Senior Industrial Data Engineer
 - **Responsibility:** Queries the in-memory telemetry database for the selected motor and identifies statistical anomalies in the raw readings.
