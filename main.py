@@ -16,6 +16,26 @@ os.environ["LITELLM_LOG"] = "ERROR"
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+load_dotenv()
+
+def configure_langsmith_env() -> None:
+    """Accept both current LangSmith env vars and older LangChain aliases."""
+    aliases = {
+        "LANGSMITH_TRACING": "LANGCHAIN_TRACING_V2",
+        "LANGSMITH_ENDPOINT": "LANGCHAIN_ENDPOINT",
+        "LANGSMITH_API_KEY": "LANGCHAIN_API_KEY",
+        "LANGSMITH_PROJECT": "LANGCHAIN_PROJECT",
+    }
+    for current_name, legacy_name in aliases.items():
+        current_value = os.environ.get(current_name)
+        legacy_value = os.environ.get(legacy_name)
+        if not current_value and legacy_value:
+            os.environ[current_name] = legacy_value
+        if not legacy_value and current_value:
+            os.environ[legacy_name] = current_value
+
+configure_langsmith_env()
+
 def local_crewai_storage_path() -> str:
     CREWAI_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     return str(CREWAI_STORAGE_DIR)
@@ -25,11 +45,10 @@ _crewai_cache.mark_cache_breakpoint = lambda msg: msg
 
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
+from langsmith import traceable
 import crewai.memory.storage.kickoff_task_outputs_storage as _kickoff_storage
 
 _kickoff_storage.db_storage_path = local_crewai_storage_path
-
-load_dotenv()
 
 groq_llm = LLM(
     model="groq/llama-3.3-70b-versatile",
@@ -50,9 +69,8 @@ class IncidentRequest(BaseModel):
 # ==========================================
 # STEP 2: TOOLS (Unchanged, Fast, Local)
 # ==========================================
-@tool("Fetch Motor Telemetry Data")
-def fetch_motor_telemetry(motor_id: str) -> str:
-    """Queries live telemetry logs for an active factory motor."""
+@traceable(name="Fetch Motor Telemetry Data", run_type="tool")
+def _fetch_motor_telemetry_impl(motor_id: str) -> str:
     motor_database = {
         "M-404": "TIMESTAMP: 16:12:05 | CURRENT: 18.5 A | VOLTAGE: 10.2 V | SPEED: 450 RPM",
         "M-200": "TIMESTAMP: 16:12:05 | CURRENT: 2.3 A | VOLTAGE: 12.0 V | SPEED: 1150 RPM"
@@ -60,9 +78,13 @@ def fetch_motor_telemetry(motor_id: str) -> str:
     normalized_id = motor_id.strip().upper()
     return f"Telemetry snapshot for {normalized_id}: {motor_database.get(normalized_id, 'Not Found')}"
 
-@tool("Search Technical Manual")
-def search_technical_manual(query: str) -> str:
-    """Searches the technical manual PDF for context pages."""
+@tool("Fetch Motor Telemetry Data")
+def fetch_motor_telemetry(motor_id: str) -> str:
+    """Queries live telemetry logs for an active factory motor."""
+    return _fetch_motor_telemetry_impl(motor_id)
+
+@traceable(name="Search Technical Manual", run_type="retriever")
+def _search_technical_manual_impl(query: str) -> str:
     from pypdf import PdfReader
     pdf_path = "rapport_technique_dataset_reel.pdf"
     if not os.path.exists(pdf_path): return "Error: Manual missing."
@@ -76,10 +98,15 @@ def search_technical_manual(query: str) -> str:
         return "\n\n".join(matched[:2]) if matched else "No context found."
     except Exception as e: return str(e)
 
+@tool("Search Technical Manual")
+def search_technical_manual(query: str) -> str:
+    """Searches the technical manual PDF for context pages."""
+    return _search_technical_manual_impl(query)
 
 # ==========================================
 # STEP 3: BACKGROUND WORKER FUNCTION
 # ==========================================
+@traceable(name="Factory AI Diagnostics Crew", run_type="chain")
 def run_crew_worker(job_id: str, motor_id: str):
     """This function runs inside an isolated background thread."""
     try:
