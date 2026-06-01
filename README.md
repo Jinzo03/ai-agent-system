@@ -1,4 +1,4 @@
-#  Factory AI Monitor — Multi-Agent Industrial Diagnostic System
+#  Factory AI Monitor : Multi-Agent Industrial Diagnostic System
 
 > **Context-bound, document-driven fault diagnostics for industrial DC motors, powered by a CrewAI multi-agent pipeline running on Groq's Llama 3.3 70B.**
 
