@@ -1,15 +1,18 @@
 import os
 import sys
 import uuid
+import shutil
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
 
 # ==========================================
 # STABILITY & COMPATIBILITY LAYER
 # ==========================================
 CREWAI_STORAGE_DIR = Path(__file__).parent / ".crewai_storage"
+UPLOAD_DIR = Path(__file__).parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 os.environ["CREWAI_DISABLE_TELEMETRY"] = "true"
 os.environ["LITELLM_LOG"] = "ERROR"
 
@@ -68,14 +71,10 @@ groq_llm = LLM(
 # ==========================================
 app = FastAPI(title="Async Industrial Incident API")
 
-# Simple dictionary acting as an in-memory database to store crew reports
 jobs_db = {}
 
-class IncidentRequest(BaseModel):
-    motor_id: str
-
 # ==========================================
-# STEP 2: TOOLS (Unchanged, Fast, Local)
+# STEP 2: GLOBAL TRACEABLE IMPLEMENTATIONS
 # ==========================================
 @traceable(name="Fetch Motor Telemetry Data", run_type="tool")
 def _fetch_motor_telemetry_impl(motor_id: str) -> str:
@@ -91,11 +90,11 @@ def fetch_motor_telemetry(motor_id: str) -> str:
     """Queries live telemetry logs for an active factory motor."""
     return _fetch_motor_telemetry_impl(motor_id)
 
+# UPGRADED: Accepts dynamic path per execution thread
 @traceable(name="Search Technical Manual", run_type="retriever")
-def _search_technical_manual_impl(query: str) -> str:
+def _search_technical_manual_impl(query: str, pdf_path: str) -> str:
     from pypdf import PdfReader
-    pdf_path = "rapport_technique_dataset_reel.pdf"
-    if not os.path.exists(pdf_path): return "Error: Manual missing."
+    if not os.path.exists(pdf_path): return "Error: Dynamic reference manual file is missing."
     try:
         reader = PdfReader(pdf_path)
         matched = []
@@ -103,21 +102,23 @@ def _search_technical_manual_impl(query: str) -> str:
             text = page.extract_text()
             if text and any(k in text.lower() for k in query.lower().split()):
                 matched.append(f"--- PAGE {i+1} ---\n{text.strip()}")
-        return "\n\n".join(matched[:2]) if matched else "No context found."
+        return "\n\n".join(matched[:2]) if matched else f"No context found matching '{query}' inside uploaded document."
     except Exception as e: return str(e)
 
-@tool("Search Technical Manual")
-def search_technical_manual(query: str) -> str:
-    """Searches the technical manual PDF for context pages."""
-    return _search_technical_manual_impl(query)
 
 # ==========================================
 # STEP 3: BACKGROUND WORKER FUNCTION
 # ==========================================
 @traceable(name="Factory AI Diagnostics Crew", run_type="chain")
-def run_crew_worker(job_id: str, motor_id: str):
-    """This function runs inside an isolated background thread."""
+def run_crew_worker(job_id: str, motor_id: str, pdf_path: str):
+    """This function runs inside an isolated background thread with a targeted file path."""
     try:
+        # Dynamic Tool Definition via Closure - Locks the Agent to this specific run's file
+        @tool("Search Technical Manual")
+        def search_technical_manual(query: str) -> str:
+            """Searches the custom technical manual uploaded by the operator for context pages."""
+            return _search_technical_manual_impl(query, pdf_path)
+
         data_engineer = Agent(
             role='Senior Industrial Data Engineer',
             goal='Query raw motor telemetry via tools and identify statistical anomalies.',
@@ -126,8 +127,8 @@ def run_crew_worker(job_id: str, motor_id: str):
         )
         diagnostic_analyst = Agent(
             role='Mechanical Diagnostic Analyst',
-            goal='Determine physical root causes strictly based on technical manuals.',
-            backstory='Electromechanical systems expert.',
+            goal='Determine physical root causes strictly based on the provided technical manual tool.',
+            backstory='Electromechanical systems expert who isolates failures using uploaded manuals.',
             llm=groq_llm, tools=[search_technical_manual]
         )
         operations_manager = Agent(
@@ -142,11 +143,11 @@ def run_crew_worker(job_id: str, motor_id: str):
             expected_output='A summary analyzing metrics.', agent=data_engineer
         )
         task_diagnose_fault = Task(
-            description='Analyze data. Search manual for "Surcharge" or "Courant" to diagnose.',
-            expected_output='A 2-sentence diagnosis citing the manual.', agent=diagnostic_analyst
+            description='Analyze telemetry bounds. Search the custom uploaded manual via your tool to determine what system anomaly or physical limitation explains these numbers.',
+            expected_output='A professional diagnosis citing manual findings.', agent=diagnostic_analyst
         )
         task_write_report = Task(
-            description='Compile findings into a clean Markdown incident report.',
+            description='Compile findings into a clean Markdown incident report detailing metrics tracked and the manual diagnosis.',
             expected_output='A professional clean Markdown formatted incident report.', agent=operations_manager
         )
 
@@ -156,7 +157,6 @@ def run_crew_worker(job_id: str, motor_id: str):
             process=Process.sequential
         )
         
-        # Execute the crew and save output to our database
         output = crew.kickoff()
         jobs_db[job_id] = {
             "status": "completed",
@@ -169,25 +169,42 @@ def run_crew_worker(job_id: str, motor_id: str):
             "error": str(e)
         }
     finally:
+        # Crucial Production Clean Up: Delete file when done to prevent server storage bloat
+        if os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except Exception:
+                pass
         if os.environ.get("LANGSMITH_API_KEY"):
             LangSmithClient().flush()
 
 # ==========================================
-# STEP 4: ASYNC API ENDPOINTS
+# STEP 4: MULTIPART FORM API ENDPOINTS
 # ==========================================
 
 @app.post("/api/v1/analyze")
-def trigger_analysis(request: IncidentRequest, background_tasks: BackgroundTasks):
-    # Generate a unique tracking token for this operation
+def trigger_analysis(
+    background_tasks: BackgroundTasks,
+    motor_id: str = Form(...),          # Accepts form variables instead of flat JSON
+    file: UploadFile = File(...)        # Intercepts incoming binary stream
+):
     job_id = str(uuid.uuid4())
     
-    # Register job state as working
-    jobs_db[job_id] = {"status": "processing", "target_motor": request.motor_id}
+    # Track destination path safely inside the container's scratch directory
+    temp_file_path = UPLOAD_DIR / f"{job_id}.pdf"
     
-    # Hand the job off to the FastAPI background worker thread instantly
-    background_tasks.add_task(run_crew_worker, job_id, request.motor_id)
+    try:
+        # Stream the file chunk by chunk to prevent memory overflows
+        with temp_file_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process manual upload: {str(e)}")
     
-    # Return immediately to the client
+    jobs_db[job_id] = {"status": "processing", "target_motor": motor_id}
+    
+    # Hand off the clean local path directly to your tracing worker thread
+    background_tasks.add_task(run_crew_worker, job_id, motor_id, str(temp_file_path))
+    
     return {
         "status": "accepted",
         "job_id": job_id,
