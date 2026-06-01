@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+crewai
+crewai[tools]
+streamlit
+requests
+python-dotenv
+pypdf
+langsmith
+litellm

@@ -17,12 +17,12 @@ if st.button("Run AI Diagnostics"):
     # 1. Trigger the background API job
     with st.spinner("Initializing Multi-Agent Crew..."):
         try:
-            start_resp = requests.post(
-                "http://127.0.0.1:8000/api/v1/analyze", 
+           start_resp = requests.post(
+                "http://backend:8000/api/v1/analyze",  # 👈 CHANGED THIS
                 json={"motor_id": motor_id}
             )
-            start_resp.raise_for_status()
-            job_id = start_resp.json()["job_id"]
+           start_resp.raise_for_status()
+           job_id = start_resp.json()["job_id"]
         except Exception as e:
             st.error(f"Failed to connect to FastAPI backend: {e}")
             st.stop()
@@ -35,7 +35,7 @@ if st.button("Run AI Diagnostics"):
     while True:
         try:
             # Check the status endpoint
-            status_resp = requests.get(f"http://127.0.0.1:8000/api/v1/status/{job_id}")
+            status_resp = requests.get(f"http://backend:8000/api/v1/status/{job_id}")
             status_data = status_resp.json()
             
             if status_data["status"] == "processing":
