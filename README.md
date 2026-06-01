@@ -269,6 +269,3 @@ Access your traces at [smith.langchain.com](https://smith.langchain.com) under t
 
 This project is released for academic and educational purposes.
 
----
-
-*Built as part of an end-of-year engineering project — ENSTAB, Advanced Technologies Program.*
