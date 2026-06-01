@@ -34,6 +34,13 @@ def configure_langsmith_env() -> None:
         if not legacy_value and current_value:
             os.environ[legacy_name] = current_value
 
+    if (
+        os.environ.get("LANGSMITH_TRACING", "").lower() == "true"
+        and not os.environ.get("LANGSMITH_API_KEY")
+    ):
+        os.environ["LANGSMITH_TRACING"] = "false"
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
 configure_langsmith_env()
 
 def local_crewai_storage_path() -> str:
@@ -45,6 +52,7 @@ _crewai_cache.mark_cache_breakpoint = lambda msg: msg
 
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
+from langsmith import Client as LangSmithClient
 from langsmith import traceable
 import crewai.memory.storage.kickoff_task_outputs_storage as _kickoff_storage
 
@@ -160,6 +168,9 @@ def run_crew_worker(job_id: str, motor_id: str):
             "status": "failed",
             "error": str(e)
         }
+    finally:
+        if os.environ.get("LANGSMITH_API_KEY"):
+            LangSmithClient().flush()
 
 # ==========================================
 # STEP 4: ASYNC API ENDPOINTS
